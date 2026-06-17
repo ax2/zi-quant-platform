@@ -17,3 +17,15 @@ def test_factor_backtest_parser_defaults_to_reproducible_sample_data():
     assert args.symbols == ["000001.SZ", "600519.SH"]
     assert args.short_window == 5
     assert args.long_window == 20
+
+
+def test_strategy_promotion_parser_defaults_to_reproducible_sample_data():
+    parser = build_parser()
+    args = parser.parse_args(["strategy-promotion"])
+
+    assert args.source == "sample"
+    assert args.symbols == ["000001.SZ", "600519.SH"]
+    assert args.short_windows == [3, 5, 8]
+    assert args.long_windows == [15, 20, 30]
+    assert args.position_ratios == [0.5, 0.8]
+    assert args.baseline_short_window == 5

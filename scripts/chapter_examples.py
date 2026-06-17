@@ -9,10 +9,13 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from app.factors import build_factor_points
+from app.experiment_records import build_experiment_record, experiment_record_payload
 from app.market_data import CleanMarketBar, clean_market_bars, coverage_report
 from app.mini_backtest import run_signal_backtest
+from app.parameter_search import run_parameter_search, score_search_result
 from app.performance_metrics import compute_performance_metrics
 from app.portfolio_backtest import portfolio_trade_summary, run_equal_weight_portfolio_backtest
+from app.promotion_gate import evaluate_strategy_promotion, promotion_decision_payload
 
 
 def _sample_rows(*, start: date, days: int, base: float, drift: float, shock_after: int | None = None) -> list[dict[str, object]]:
@@ -186,6 +189,64 @@ def print_factor_backtest(args: argparse.Namespace) -> int:
     return 0
 
 
+def print_strategy_promotion(args: argparse.Namespace) -> int:
+    bars = _load_bars(args)
+    print("coverage", coverage_report(bars))
+
+    symbol = args.symbols[0]
+    ranked = run_parameter_search(
+        symbol,
+        bars,
+        initial_cash=args.initial_cash,
+        short_windows=args.short_windows,
+        long_windows=args.long_windows,
+        position_ratios=args.position_ratios,
+        top_n=args.top_n,
+    )
+    baseline = run_parameter_search(
+        symbol,
+        bars,
+        initial_cash=args.initial_cash,
+        short_windows=(args.baseline_short_window,),
+        long_windows=(args.baseline_long_window,),
+        position_ratios=(args.baseline_position_ratio,),
+        top_n=1,
+    )[0]
+    candidate = ranked[0]
+
+    print(f"\nchapter-13 parameter_search {symbol}")
+    for index, result in enumerate(ranked[:3], start=1):
+        print(
+            f"rank={index}",
+            f"params={result.params.__dict__}",
+            f"score={score_search_result(result):.6f}",
+            f"return={result.metrics.total_return:.4%}",
+            f"drawdown={result.metrics.max_drawdown:.4%}",
+            f"trades={result.metrics.trade_count}",
+        )
+
+    record = build_experiment_record(
+        "sample-momentum-parameter-search",
+        candidate=candidate,
+        baseline=baseline,
+        experiment_id="sample-exp-001",
+    )
+    record_payload = experiment_record_payload(record)
+    comparison = record_payload["candidate"]["comparison"]
+    print("\nchapter-14 experiment_record")
+    print(
+        f"experiment_id={record.experiment_id}",
+        f"status={record.status}",
+        f"decision={record.decision}",
+        f"deltas={comparison['deltas']}",
+    )
+
+    decision = evaluate_strategy_promotion(record_payload)
+    print("\nchapter-15 promotion_gate")
+    print(promotion_decision_payload(decision))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Runnable examples for ZiQuant blog chapters.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -198,6 +259,21 @@ def build_parser() -> argparse.ArgumentParser:
     factor.add_argument("--short-window", type=int, default=5)
     factor.add_argument("--long-window", type=int, default=20)
     factor.set_defaults(func=print_factor_backtest)
+
+    promotion = subparsers.add_parser("strategy-promotion", help="Run chapter 13-15 parameter/search/promotion chain.")
+    promotion.add_argument("--source", choices=["sample", "eastmoney"], default="sample")
+    promotion.add_argument("--symbols", nargs="+", default=["000001.SZ", "600519.SH"])
+    promotion.add_argument("--begin", default="20250101")
+    promotion.add_argument("--end", default="20251231")
+    promotion.add_argument("--initial-cash", type=float, default=100000.0)
+    promotion.add_argument("--short-windows", nargs="+", type=int, default=[3, 5, 8])
+    promotion.add_argument("--long-windows", nargs="+", type=int, default=[15, 20, 30])
+    promotion.add_argument("--position-ratios", nargs="+", type=float, default=[0.5, 0.8])
+    promotion.add_argument("--top-n", type=int, default=5)
+    promotion.add_argument("--baseline-short-window", type=int, default=5)
+    promotion.add_argument("--baseline-long-window", type=int, default=20)
+    promotion.add_argument("--baseline-position-ratio", type=float, default=0.8)
+    promotion.set_defaults(func=print_strategy_promotion)
     return parser
 
 

@@ -63,3 +63,15 @@ def test_paper_notify_parser_defaults_to_reproducible_notification_cycle():
     assert args.extra_symbol == "600519.SH"
     assert args.candidates == ["000001.SZ", "600519.SH", "000001.SZ"]
     assert args.max_total == 0.55
+
+
+def test_paper_ops_check_parser_defaults_to_reproducible_ops_cycle():
+    parser = build_parser()
+    args = parser.parse_args(["paper-ops-check"])
+
+    assert args.trade_date == "2026-03-05"
+    assert args.window_start == "15:10:00"
+    assert args.window_end == "15:40:00"
+    assert args.seed_symbol == "000001.SZ"
+    assert args.extra_symbol == "600519.SH"
+    assert args.candidates == ["000001.SZ", "600519.SH"]

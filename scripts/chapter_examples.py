@@ -4,13 +4,14 @@ import argparse
 import json
 import math
 import tempfile
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from app.alert_messages import format_paper_daily_alert
+from app.data_gaps import build_price_gap_plan, gap_symbols
 from app.experiment_records import build_experiment_record, experiment_record_payload
 from app.factors import build_factor_points
 from app.file_notifications import FileNotificationChannel, read_file_notifications
@@ -30,7 +31,11 @@ from app.price_providers import StaticPriceProvider, collect_required_price_symb
 from app.production_checks import check_paper_cycle_inputs, check_paper_cycle_result
 from app.promotion_gate import evaluate_strategy_promotion, promotion_decision_payload
 from app.rebalance_plan import build_rebalance_plan
-from app.run_health import build_run_health_report
+from app.report_archive import archive_daily_report, read_archived_report
+from app.run_health import RunHealthReport, build_run_health_report
+from app.run_history import summarize_archived_reports
+from app.run_window import RunWindow, evaluate_run_window
+from app.ops_checklist import build_ops_checklist
 from app.target_weight_policy import TargetWeightPolicy, build_equal_weight_targets, normalize_target_weights
 
 
@@ -580,6 +585,139 @@ def print_paper_notify(args: argparse.Namespace) -> int:
     return 0
 
 
+def print_paper_ops_check(args: argparse.Namespace) -> int:
+    trade_date = date.fromisoformat(args.trade_date)
+    now = datetime.fromisoformat(args.now).replace(tzinfo=timezone.utc)
+    account = PaperAccountState(cash=args.initial_cash)
+
+    seed = apply_paper_order(
+        account,
+        trade_date=trade_date - timedelta(days=1),
+        symbol=args.seed_symbol,
+        side="buy",
+        price=args.seed_price,
+        shares=args.seed_shares,
+    )
+    if not seed.accepted:
+        raise RuntimeError(f"seed order rejected: {seed.reason}")
+    account = seed.account
+
+    window = RunWindow(start=time.fromisoformat(args.window_start), end=time.fromisoformat(args.window_end))
+    window_status = evaluate_run_window(now, window)
+    print("chapter-31-35 paper_ops_check")
+    print("\nchapter-31 run_window")
+    print(
+        f"now={now.isoformat()}",
+        f"window={args.window_start}-{args.window_end}",
+        f"allowed={window_status.allowed}",
+        f"reason={window_status.reason}",
+        f"next_run_at={window_status.next_run_at.isoformat() if window_status.next_run_at else '-'}",
+    )
+
+    targets = normalize_target_weights(
+        build_equal_weight_targets(
+            args.candidates,
+            TargetWeightPolicy(max_symbols=args.max_symbols, gross_exposure=args.gross_exposure),
+        ),
+        max_total=args.max_total,
+    )
+    required_symbols = collect_required_price_symbols(list(account.positions), targets)
+    provider = StaticPriceProvider(
+        {
+            args.seed_symbol: args.seed_last_price,
+            args.extra_symbol: args.extra_last_price,
+        }
+    )
+    price_snapshot = provider.get_last_prices(required_symbols, trade_date=trade_date)
+    input_report = check_paper_cycle_inputs(account, last_prices=price_snapshot.prices, target_weights=targets)
+    result = run_paper_daily_cycle(
+        account,
+        trade_date=trade_date,
+        last_prices=price_snapshot.prices,
+        target_weights=targets,
+        review_note="ops checklist archive",
+    )
+    result_report = check_paper_cycle_result(result)
+    receipt = send_paper_alert(
+        MemoryNotificationChannel(),
+        result.alert_message,
+        destination=args.destination,
+        sent_at=now,
+    )
+    health = build_run_health_report(
+        price_snapshot=price_snapshot,
+        input_check=input_report,
+        result_check=result_report,
+        notification_receipt=receipt,
+    )
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        archive_dir = Path(tmp_dir) / "reports"
+        previous_result = run_paper_daily_cycle(
+            account,
+            trade_date=trade_date - timedelta(days=1),
+            last_prices={args.seed_symbol: args.seed_price, args.extra_symbol: args.extra_last_price},
+            target_weights=targets,
+            review_note="previous blocked run",
+        )
+        previous_archive = archive_daily_report(
+            directory=archive_dir,
+            trade_date=trade_date - timedelta(days=1),
+            alert_message=previous_result.alert_message,
+            health_report=RunHealthReport("blocker", 1, False, 1, "previous run blocked by missing data"),
+            review_record=previous_result.review_record,
+        )
+        current_archive = archive_daily_report(
+            directory=archive_dir,
+            trade_date=trade_date,
+            alert_message=result.alert_message,
+            health_report=health,
+            review_record=result.review_record,
+        )
+        current_payload = read_archived_report(current_archive.path)
+        history = summarize_archived_reports(archive_dir)
+
+    print("\nchapter-32 report_archive")
+    print(
+        f"archived={current_archive.path.name}",
+        f"status={current_archive.status}",
+        f"payload_keys={sorted(current_payload)}",
+    )
+    print(f"previous_archive={previous_archive.path.name} status={previous_archive.status}")
+
+    print("\nchapter-33 run_history")
+    print(
+        f"report_count={history.report_count}",
+        f"latest_trade_date={history.latest_trade_date}",
+        f"latest_status={history.latest_status}",
+        f"blocker_count={history.blocker_count}",
+        f"notification_success_rate={history.notification_success_rate:.2%}",
+    )
+
+    gap_provider = StaticPriceProvider({args.seed_symbol: args.seed_last_price})
+    gap_snapshot = gap_provider.get_last_prices(required_symbols, trade_date=trade_date)
+    gap_plan = build_price_gap_plan(gap_snapshot, required_symbols=required_symbols)
+    print("\nchapter-34 data_gaps")
+    print(
+        f"required_symbols={required_symbols}",
+        f"available_prices={sorted(gap_snapshot.prices)}",
+        f"severity={gap_plan.severity}",
+        f"gap_symbols={gap_symbols(gap_plan)}",
+    )
+
+    checklist = build_ops_checklist(
+        window_status=window_status,
+        history_summary=history,
+        gap_plan=gap_plan,
+        health_report=health,
+    )
+    print("\nchapter-35 ops_checklist")
+    print(f"passed={checklist.passed} items={len(checklist.items)}")
+    for item in checklist.items:
+        print(f"{item.name}: passed={item.passed} detail={item.detail}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Runnable examples for ZiQuant blog chapters.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -655,6 +793,25 @@ def build_parser() -> argparse.ArgumentParser:
     notify.add_argument("--max-total", type=float, default=0.55)
     notify.add_argument("--destination", default="paper-daily")
     notify.set_defaults(func=print_paper_notify)
+
+    ops_check = subparsers.add_parser("paper-ops-check", help="Run chapter 31-35 run window/archive/history/gap/checklist chain.")
+    ops_check.add_argument("--trade-date", default="2026-03-05")
+    ops_check.add_argument("--now", default="2026-03-05T15:20:00")
+    ops_check.add_argument("--window-start", default="15:10:00")
+    ops_check.add_argument("--window-end", default="15:40:00")
+    ops_check.add_argument("--initial-cash", type=float, default=200000.0)
+    ops_check.add_argument("--seed-symbol", default="000001.SZ")
+    ops_check.add_argument("--seed-price", type=float, default=11.90)
+    ops_check.add_argument("--seed-shares", type=int, default=4000)
+    ops_check.add_argument("--seed-last-price", type=float, default=12.25)
+    ops_check.add_argument("--extra-symbol", default="600519.SH")
+    ops_check.add_argument("--extra-last-price", type=float, default=1502.00)
+    ops_check.add_argument("--candidates", nargs="+", default=["000001.SZ", "600519.SH"])
+    ops_check.add_argument("--max-symbols", type=int, default=2)
+    ops_check.add_argument("--gross-exposure", type=float, default=0.60)
+    ops_check.add_argument("--max-total", type=float, default=0.55)
+    ops_check.add_argument("--destination", default="paper-daily")
+    ops_check.set_defaults(func=print_paper_ops_check)
     return parser
 
 

@@ -3,22 +3,28 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import tempfile
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Iterable
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from app.factors import build_factor_points
-from app.experiment_records import build_experiment_record, experiment_record_payload
 from app.alert_messages import format_paper_daily_alert
+from app.experiment_records import build_experiment_record, experiment_record_payload
+from app.factors import build_factor_points
 from app.market_data import CleanMarketBar, clean_market_bars, coverage_report
 from app.mini_backtest import run_signal_backtest
 from app.parameter_search import run_parameter_search, score_search_result
+from app.paper_daily_cycle import run_paper_daily_cycle
 from app.paper_ledger import PaperAccountState, apply_paper_order
+from app.paper_review import summarize_paper_reviews
 from app.paper_risk import evaluate_paper_risk
 from app.paper_snapshots import build_paper_account_snapshot
+from app.paper_state_store import load_paper_account, save_paper_account
 from app.performance_metrics import compute_performance_metrics
 from app.portfolio_backtest import portfolio_trade_summary, run_equal_weight_portfolio_backtest
+from app.production_checks import check_paper_cycle_inputs, check_paper_cycle_result
 from app.promotion_gate import evaluate_strategy_promotion, promotion_decision_payload
 from app.rebalance_plan import build_rebalance_plan
 
@@ -342,6 +348,111 @@ def print_paper_flow(args: argparse.Namespace) -> int:
     return 0
 
 
+def print_paper_ops(args: argparse.Namespace) -> int:
+    trade_date = date.fromisoformat(args.trade_date)
+    previous_date = trade_date - timedelta(days=1)
+    account = PaperAccountState(cash=args.initial_cash)
+
+    for symbol, price, shares in (
+        (args.primary_symbol, args.primary_buy_price, args.primary_buy_shares),
+        (args.secondary_symbol, args.secondary_buy_price, args.secondary_buy_shares),
+    ):
+        execution = apply_paper_order(
+            account,
+            trade_date=previous_date,
+            symbol=symbol,
+            side="buy",
+            price=price,
+            shares=shares,
+        )
+        if not execution.accepted:
+            raise RuntimeError(f"sample order rejected: {symbol} {execution.reason}")
+        account = execution.account
+
+    last_prices = {
+        args.primary_symbol: args.primary_last_price,
+        args.secondary_symbol: args.secondary_last_price,
+    }
+    target_weights = {
+        args.primary_symbol: args.primary_target_weight,
+        args.secondary_symbol: args.secondary_target_weight,
+    }
+
+    print("chapter-21-25 paper_ops")
+    print(f"seed_account cash={account.cash:.2f} positions={len(account.positions)}")
+
+    input_report = check_paper_cycle_inputs(account, last_prices=last_prices, target_weights=target_weights)
+    print("\nchapter-25 input_check")
+    print(f"passed={input_report.passed} issues={len(input_report.issues)}")
+    for issue in input_report.issues:
+        print(f"{issue.severity} {issue.code}: {issue.message}")
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        state_path = Path(tmp_dir) / "paper-account.json"
+        save_paper_account(account, state_path)
+        loaded_account = load_paper_account(state_path)
+        print("\nchapter-24 state_store")
+        print(
+            f"saved={state_path.name}",
+            f"cash={loaded_account.cash:.2f}",
+            f"positions={sorted(loaded_account.positions)}",
+        )
+
+        previous_result = run_paper_daily_cycle(
+            loaded_account,
+            trade_date=previous_date,
+            last_prices={
+                args.primary_symbol: args.primary_buy_price,
+                args.secondary_symbol: args.secondary_buy_price,
+            },
+            target_weights=target_weights,
+            review_note="previous close baseline",
+        )
+        result = run_paper_daily_cycle(
+            loaded_account,
+            trade_date=trade_date,
+            last_prices=last_prices,
+            target_weights=target_weights,
+            review_note=args.review_note,
+        )
+
+    print("\nchapter-23 daily_cycle")
+    print(
+        f"trade_date={result.snapshot.trade_date.isoformat()}",
+        f"total_equity={result.snapshot.total_equity:.2f}",
+        f"risk={result.risk_report.severity}",
+        f"orders={len(result.rebalance_plan.orders)}",
+        f"alert={result.alert_message.severity}",
+    )
+
+    print("\nchapter-21 recommendation")
+    print(
+        f"action={result.recommendation.action}",
+        f"severity={result.recommendation.severity}",
+        f"order_count={result.recommendation.order_count}",
+    )
+    print(f"summary={result.recommendation.summary}")
+    print(f"reasons={', '.join(result.recommendation.reasons)}")
+
+    print("\nchapter-22 review_summary")
+    summary = summarize_paper_reviews((previous_result.review_record, result.review_record))
+    print(
+        f"records={len(summary.records)}",
+        f"latest_equity={summary.latest_equity:.2f}",
+        f"equity_change={summary.equity_change:.2f}",
+        f"blocker_days={summary.blocker_days}",
+        f"actions={summary.action_counts}",
+    )
+
+    print("\nchapter-25 result_check")
+    result_report = check_paper_cycle_result(result)
+    print(f"passed={result_report.passed} issues={len(result_report.issues)}")
+    for issue in result_report.issues:
+        print(f"{issue.severity} {issue.code}: {issue.message}")
+
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Runnable examples for ZiQuant blog chapters.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -383,6 +494,22 @@ def build_parser() -> argparse.ArgumentParser:
     paper.add_argument("--min-cash-ratio", type=float, default=0.05)
     paper.add_argument("--max-exposure-ratio", type=float, default=0.95)
     paper.set_defaults(func=print_paper_flow)
+
+    ops = subparsers.add_parser("paper-ops", help="Run chapter 21-25 recommendation/review/state/check chain.")
+    ops.add_argument("--trade-date", default="2026-03-03")
+    ops.add_argument("--initial-cash", type=float, default=300000.0)
+    ops.add_argument("--primary-symbol", default="000001.SZ")
+    ops.add_argument("--primary-buy-price", type=float, default=11.80)
+    ops.add_argument("--primary-buy-shares", type=int, default=3600)
+    ops.add_argument("--primary-last-price", type=float, default=12.40)
+    ops.add_argument("--primary-target-weight", type=float, default=0.20)
+    ops.add_argument("--secondary-symbol", default="600519.SH")
+    ops.add_argument("--secondary-buy-price", type=float, default=1520.00)
+    ops.add_argument("--secondary-buy-shares", type=int, default=100)
+    ops.add_argument("--secondary-last-price", type=float, default=1495.00)
+    ops.add_argument("--secondary-target-weight", type=float, default=0.35)
+    ops.add_argument("--review-note", default="daily paper ops review")
+    ops.set_defaults(func=print_paper_ops)
     return parser
 
 

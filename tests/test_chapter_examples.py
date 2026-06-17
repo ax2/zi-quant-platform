@@ -40,3 +40,14 @@ def test_paper_flow_parser_defaults_to_reproducible_sample_account():
     assert args.symbol == "000001.SZ"
     assert args.buy_shares == 6400
     assert args.target_weight == 0.45
+
+
+def test_paper_ops_parser_defaults_to_reproducible_sample_cycle():
+    parser = build_parser()
+    args = parser.parse_args(["paper-ops"])
+
+    assert args.trade_date == "2026-03-03"
+    assert args.initial_cash == 300000.0
+    assert args.primary_symbol == "000001.SZ"
+    assert args.secondary_symbol == "600519.SH"
+    assert args.secondary_target_weight == 0.35

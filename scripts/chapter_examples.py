@@ -1,0 +1,211 @@
+from __future__ import annotations
+
+import argparse
+import json
+import math
+from datetime import date, timedelta
+from typing import Iterable
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+from app.factors import build_factor_points
+from app.market_data import CleanMarketBar, clean_market_bars, coverage_report
+from app.mini_backtest import run_signal_backtest
+from app.performance_metrics import compute_performance_metrics
+from app.portfolio_backtest import portfolio_trade_summary, run_equal_weight_portfolio_backtest
+
+
+def _sample_rows(*, start: date, days: int, base: float, drift: float, shock_after: int | None = None) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    price = base
+    for offset in range(days):
+        trade_date = start + timedelta(days=offset)
+        if trade_date.weekday() >= 5:
+            continue
+        wave = math.sin(offset / 3) * 0.18
+        price = max(1.0, price + drift + wave)
+        if shock_after is not None and offset >= shock_after:
+            price *= 0.985
+        open_price = round(price * 0.995, 2)
+        close = round(price, 2)
+        high = round(max(open_price, close) * 1.015, 2)
+        low = round(min(open_price, close) * 0.985, 2)
+        volume = 1_000_000 + offset * 20_000
+        rows.append(
+            {
+                "trade_date": trade_date.isoformat(),
+                "open": open_price,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": volume,
+                "amount": round(volume * close, 2),
+            }
+        )
+    return rows
+
+
+def sample_bars() -> list[CleanMarketBar]:
+    specs = {
+        "000001.SZ": {"base": 10.0, "drift": 0.08, "shock_after": None},
+        "600519.SH": {"base": 1500.0, "drift": 2.8, "shock_after": 34},
+    }
+    bars: list[CleanMarketBar] = []
+    for symbol, spec in specs.items():
+        cleaned, rejected = clean_market_bars(
+            symbol,
+            _sample_rows(start=date(2026, 1, 2), days=58, **spec),
+            source="sample",
+        )
+        if rejected:
+            raise RuntimeError(f"sample data unexpectedly rejected: {rejected[:1]}")
+        bars.extend(cleaned)
+    return sorted(bars, key=lambda item: (item.symbol, item.trade_date))
+
+
+def _eastmoney_secid(symbol: str) -> str:
+    code, _, suffix = symbol.partition(".")
+    if suffix.upper() == "SH":
+        return f"1.{code}"
+    if suffix.upper() == "SZ":
+        return f"0.{code}"
+    raise ValueError(f"unsupported symbol suffix: {symbol}")
+
+
+def eastmoney_bars(symbols: Iterable[str], *, begin: str, end: str) -> list[CleanMarketBar]:
+    bars: list[CleanMarketBar] = []
+    for symbol in symbols:
+        params = {
+            "secid": _eastmoney_secid(symbol),
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57",
+            "klt": "101",
+            "fqt": "1",
+            "beg": begin,
+            "end": end,
+        }
+        url = f"https://push2his.eastmoney.com/api/qt/stock/kline/get?{urlencode(params)}"
+        request = Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 ZiQuantExample/1.0",
+                "Accept": "application/json,text/plain,*/*",
+                "Referer": "https://quote.eastmoney.com/",
+            },
+        )
+        with urlopen(request, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        klines = ((payload.get("data") or {}).get("klines") or [])[-80:]
+        rows = []
+        for line in klines:
+            trade_date, open_price, close, high, low, volume, amount = line.split(",")[:7]
+            rows.append(
+                {
+                    "trade_date": trade_date,
+                    "open": open_price,
+                    "high": high,
+                    "low": low,
+                    "close": close,
+                    "volume": volume,
+                    "amount": amount,
+                }
+            )
+        cleaned, rejected = clean_market_bars(symbol, rows, source="eastmoney")
+        if rejected:
+            print(f"{symbol} rejected_rows={len(rejected)}")
+        bars.extend(cleaned)
+    return sorted(bars, key=lambda item: (item.symbol, item.trade_date))
+
+
+def _load_bars(args: argparse.Namespace) -> list[CleanMarketBar]:
+    if args.source == "eastmoney":
+        return eastmoney_bars(args.symbols, begin=args.begin, end=args.end)
+    return [bar for bar in sample_bars() if bar.symbol in set(args.symbols)]
+
+
+def print_factor_backtest(args: argparse.Namespace) -> int:
+    bars = _load_bars(args)
+    print("coverage", coverage_report(bars))
+
+    first_symbol = args.symbols[0]
+    first_bars = [bar for bar in bars if bar.symbol == first_symbol]
+    factors = build_factor_points(first_bars, short_window=args.short_window, long_window=args.long_window, volatility_window=args.short_window)
+    print(f"\nchapter-09 factors {first_symbol}")
+    for point in factors[-5:]:
+        print(
+            point.trade_date.isoformat(),
+            f"close={point.close:.2f}",
+            f"ma_short={point.ma_short}",
+            f"ma_long={point.ma_long}",
+            f"momentum={point.momentum}",
+            f"volatility={point.volatility}",
+            f"signal={point.signal}",
+        )
+
+    single = run_signal_backtest(
+        first_symbol,
+        first_bars,
+        initial_cash=args.initial_cash,
+        short_window=args.short_window,
+        long_window=args.long_window,
+    )
+    print(f"\nchapter-10 mini_backtest {first_symbol}")
+    print(
+        f"final_equity={single.final_equity:.2f}",
+        f"total_return={single.total_return:.4%}",
+        f"max_drawdown={single.max_drawdown:.4%}",
+        f"trades={len(single.trades)}",
+    )
+    for trade in single.trades[:4]:
+        print(trade.trade_date.isoformat(), trade.side, f"shares={trade.shares}", f"price={trade.price:.2f}", trade.reason)
+
+    portfolio = run_equal_weight_portfolio_backtest(
+        args.symbols,
+        bars,
+        initial_cash=args.initial_cash,
+        position_ratio=0.8,
+    )
+    print("\nchapter-11 portfolio_backtest")
+    print(
+        f"symbols={len(portfolio.symbol_results)}",
+        f"final_equity={portfolio.final_equity:.2f}",
+        f"total_return={portfolio.total_return:.4%}",
+        f"max_drawdown={portfolio.max_drawdown:.4%}",
+        f"trade_summary={portfolio_trade_summary(portfolio)}",
+    )
+
+    all_trades = [trade for result in portfolio.symbol_results for trade in result.trades]
+    metrics = compute_performance_metrics(
+        portfolio.equity_curve,
+        all_trades,
+        initial_cash=args.initial_cash,
+        max_drawdown=portfolio.max_drawdown,
+    )
+    print("\nchapter-12 performance_metrics")
+    print(metrics)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Runnable examples for ZiQuant blog chapters.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    factor = subparsers.add_parser("factor-backtest", help="Run chapter 09-12 factor/backtest chain.")
+    factor.add_argument("--source", choices=["sample", "eastmoney"], default="sample")
+    factor.add_argument("--symbols", nargs="+", default=["000001.SZ", "600519.SH"])
+    factor.add_argument("--begin", default="20250101")
+    factor.add_argument("--end", default="20251231")
+    factor.add_argument("--initial-cash", type=float, default=100000.0)
+    factor.add_argument("--short-window", type=int, default=5)
+    factor.add_argument("--long-window", type=int, default=20)
+    factor.set_defaults(func=print_factor_backtest)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

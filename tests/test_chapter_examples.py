@@ -85,3 +85,13 @@ def test_paper_run_plan_parser_defaults_to_reproducible_plan_cycle():
     assert args.generated_at == "2026-03-06T15:20:00"
     assert args.required_symbols == ["000001.SZ", "600519.SH", "000001.SZ"]
     assert args.dry_run is False
+
+
+def test_paper_command_parser_defaults_to_reproducible_command_cycle():
+    parser = build_parser()
+    args = parser.parse_args(["paper-command"])
+
+    assert args.trade_date == "2026-03-07"
+    assert args.generated_at == "2026-03-07T15:20:00"
+    assert args.required_symbols == ["000001.SZ", "600519.SH"]
+    assert args.dry_run is False

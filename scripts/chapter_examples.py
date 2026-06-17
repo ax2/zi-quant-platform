@@ -12,7 +12,11 @@ from urllib.request import Request, urlopen
 
 from app.alert_messages import format_paper_daily_alert
 from app.daily_run_plan import build_daily_run_plan, plan_can_execute
+from app.daily_run_artifacts import read_daily_run_artifact, write_daily_run_artifact
+from app.daily_run_command import write_daily_run_command_response
+from app.daily_run_summary import build_daily_run_summary, format_daily_run_summary
 from app.data_gaps import build_price_gap_plan, gap_symbols
+from app.execution_guard import decide_execution, execution_decision_line
 from app.experiment_records import build_experiment_record, experiment_record_payload
 from app.factors import build_factor_points
 from app.file_notifications import FileNotificationChannel, read_file_notifications
@@ -38,7 +42,8 @@ from app.run_health import RunHealthReport, build_run_health_report
 from app.run_history import summarize_archived_reports
 from app.run_request import build_daily_run_request, request_symbol_count
 from app.run_window import RunWindow, evaluate_run_window
-from app.ops_checklist import build_ops_checklist
+from app.ops_checklist import OpsChecklist, OpsChecklistItem, build_ops_checklist
+from app.ops_runbook import build_ops_runbook, runbook_as_lines
 from app.target_weight_policy import TargetWeightPolicy, build_equal_weight_targets, normalize_target_weights
 
 
@@ -810,6 +815,72 @@ def print_paper_run_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def print_paper_command(args: argparse.Namespace) -> int:
+    trade_date = date.fromisoformat(args.trade_date)
+    generated_at = datetime.fromisoformat(args.generated_at).replace(tzinfo=timezone.utc)
+    request = build_daily_run_request(
+        trade_date=trade_date,
+        generated_at=generated_at,
+        required_symbols=args.required_symbols,
+        dry_run=args.dry_run,
+    )
+    checklist = OpsChecklist(
+        passed=False,
+        items=(
+            OpsChecklistItem("run_window", True, "inside_window"),
+            OpsChecklistItem("history_ready", True, "ok"),
+            OpsChecklistItem("data_gaps", False, "blocker"),
+            OpsChecklistItem("run_health", True, "ok"),
+        ),
+    )
+    plan = build_daily_run_plan(request=request, checklist=checklist)
+
+    print("chapter-41-45 paper_command")
+    summary = build_daily_run_summary(plan)
+    print("\nchapter-41 daily_run_summary")
+    print(format_daily_run_summary(summary))
+    print(
+        f"status={summary.status}",
+        f"dry_run={summary.dry_run}",
+        f"symbol_count={summary.symbol_count}",
+        f"failed_check_count={summary.failed_check_count}",
+    )
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        artifact_dir = Path(tmp_dir) / "artifacts"
+        artifact = write_daily_run_artifact(plan, directory=artifact_dir)
+        payload = read_daily_run_artifact(artifact.path)
+        response = write_daily_run_command_response(plan=plan, artifact_dir=artifact_dir)
+
+        print("\nchapter-42 daily_run_artifact")
+        print(
+            f"artifact={artifact.path.name}",
+            f"payload_keys={sorted(payload)}",
+            f"failed_checks={payload['failed_checks']}",
+            f"actions={[action['action'] for action in payload['actions']]}",
+            f"executable={payload['executable']}",
+        )
+
+        print("\nchapter-43 daily_run_command")
+        print(
+            f"status={response.status}",
+            f"exit_code={response.exit_code}",
+            f"artifact={response.artifact_path.name}",
+            f"message={response.message}",
+        )
+
+    decision = decide_execution(plan)
+    print("\nchapter-44 execution_guard")
+    print(execution_decision_line(decision))
+    print(f"allowed={decision.allowed} reason={decision.reason} required_actions={decision.required_actions}")
+
+    runbook = build_ops_runbook(plan)
+    print("\nchapter-45 ops_runbook")
+    for line in runbook_as_lines(runbook):
+        print(line)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Runnable examples for ZiQuant blog chapters.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -912,6 +983,13 @@ def build_parser() -> argparse.ArgumentParser:
     run_plan.add_argument("--first-price", type=float, default=12.30)
     run_plan.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=False)
     run_plan.set_defaults(func=print_paper_run_plan)
+
+    command = subparsers.add_parser("paper-command", help="Run chapter 41-45 summary/artifact/command/guard/runbook chain.")
+    command.add_argument("--trade-date", default="2026-03-07")
+    command.add_argument("--generated-at", default="2026-03-07T15:20:00")
+    command.add_argument("--required-symbols", nargs="+", default=["000001.SZ", "600519.SH"])
+    command.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=False)
+    command.set_defaults(func=print_paper_command)
     return parser
 
 

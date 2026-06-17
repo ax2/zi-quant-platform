@@ -51,3 +51,15 @@ def test_paper_ops_parser_defaults_to_reproducible_sample_cycle():
     assert args.primary_symbol == "000001.SZ"
     assert args.secondary_symbol == "600519.SH"
     assert args.secondary_target_weight == 0.35
+
+
+def test_paper_notify_parser_defaults_to_reproducible_notification_cycle():
+    parser = build_parser()
+    args = parser.parse_args(["paper-notify"])
+
+    assert args.trade_date == "2026-03-04"
+    assert args.destination == "paper-daily"
+    assert args.seed_symbol == "000001.SZ"
+    assert args.extra_symbol == "600519.SH"
+    assert args.candidates == ["000001.SZ", "600519.SH", "000001.SZ"]
+    assert args.max_total == 0.55

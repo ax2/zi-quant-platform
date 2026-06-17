@@ -4,7 +4,7 @@ import argparse
 import json
 import math
 import tempfile
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 from urllib.parse import urlencode
@@ -13,8 +13,10 @@ from urllib.request import Request, urlopen
 from app.alert_messages import format_paper_daily_alert
 from app.experiment_records import build_experiment_record, experiment_record_payload
 from app.factors import build_factor_points
+from app.file_notifications import FileNotificationChannel, read_file_notifications
 from app.market_data import CleanMarketBar, clean_market_bars, coverage_report
 from app.mini_backtest import run_signal_backtest
+from app.notification_channels import MemoryNotificationChannel, send_paper_alert
 from app.parameter_search import run_parameter_search, score_search_result
 from app.paper_daily_cycle import run_paper_daily_cycle
 from app.paper_ledger import PaperAccountState, apply_paper_order
@@ -24,9 +26,12 @@ from app.paper_snapshots import build_paper_account_snapshot
 from app.paper_state_store import load_paper_account, save_paper_account
 from app.performance_metrics import compute_performance_metrics
 from app.portfolio_backtest import portfolio_trade_summary, run_equal_weight_portfolio_backtest
+from app.price_providers import StaticPriceProvider, collect_required_price_symbols
 from app.production_checks import check_paper_cycle_inputs, check_paper_cycle_result
 from app.promotion_gate import evaluate_strategy_promotion, promotion_decision_payload
 from app.rebalance_plan import build_rebalance_plan
+from app.run_health import build_run_health_report
+from app.target_weight_policy import TargetWeightPolicy, build_equal_weight_targets, normalize_target_weights
 
 
 def _sample_rows(*, start: date, days: int, base: float, drift: float, shock_after: int | None = None) -> list[dict[str, object]]:
@@ -453,6 +458,128 @@ def print_paper_ops(args: argparse.Namespace) -> int:
     return 0
 
 
+def print_paper_notify(args: argparse.Namespace) -> int:
+    trade_date = date.fromisoformat(args.trade_date)
+    sent_at = datetime.fromisoformat(args.sent_at).replace(tzinfo=timezone.utc)
+    account = PaperAccountState(cash=args.initial_cash)
+
+    seed = apply_paper_order(
+        account,
+        trade_date=trade_date - timedelta(days=1),
+        symbol=args.seed_symbol,
+        side="buy",
+        price=args.seed_price,
+        shares=args.seed_shares,
+    )
+    if not seed.accepted:
+        raise RuntimeError(f"seed order rejected: {seed.reason}")
+    account = seed.account
+
+    print("chapter-26-30 paper_notify")
+    print(f"seed_account cash={account.cash:.2f} positions={sorted(account.positions)}")
+
+    raw_targets = build_equal_weight_targets(
+        args.candidates,
+        TargetWeightPolicy(
+            max_symbols=args.max_symbols,
+            gross_exposure=args.gross_exposure,
+            min_weight=args.min_weight,
+        ),
+    )
+    targets = normalize_target_weights(raw_targets, max_total=args.max_total)
+    print("\nchapter-29 target_weight_policy")
+    print(f"candidates={args.candidates}")
+    print(f"raw_targets={raw_targets}")
+    print(f"normalized_targets={targets} total={sum(targets.values()):.2%}")
+
+    required_symbols = collect_required_price_symbols(list(account.positions), targets)
+    provider = StaticPriceProvider(
+        {
+            args.seed_symbol: args.seed_last_price,
+            args.extra_symbol: args.extra_last_price,
+        }
+    )
+    price_snapshot = provider.get_last_prices(required_symbols, trade_date=trade_date)
+    print("\nchapter-28 price_provider")
+    print(f"required_symbols={required_symbols}")
+    print(f"prices={price_snapshot.prices}")
+    print(f"missing_symbols={price_snapshot.missing_symbols}")
+
+    input_report = check_paper_cycle_inputs(account, last_prices=price_snapshot.prices, target_weights=targets)
+    if not input_report.passed:
+        print("\nchapter-25 input_check")
+        print(f"passed={input_report.passed} issues={len(input_report.issues)}")
+        for issue in input_report.issues:
+            print(f"{issue.severity} {issue.code}: {issue.message}")
+        return 1
+
+    result = run_paper_daily_cycle(
+        account,
+        trade_date=trade_date,
+        last_prices=price_snapshot.prices,
+        target_weights=targets,
+        review_note="notify flow review",
+    )
+    result_report = check_paper_cycle_result(result)
+    print("\nchapter-23 daily_cycle")
+    print(
+        f"trade_date={result.snapshot.trade_date.isoformat()}",
+        f"total_equity={result.snapshot.total_equity:.2f}",
+        f"risk={result.risk_report.severity}",
+        f"orders={len(result.rebalance_plan.orders)}",
+    )
+
+    memory_receipt = send_paper_alert(
+        MemoryNotificationChannel(),
+        result.alert_message,
+        destination=args.destination,
+        sent_at=sent_at,
+    )
+    print("\nchapter-26 notification_channel")
+    print(
+        f"channel={memory_receipt.channel}",
+        f"accepted={memory_receipt.accepted}",
+        f"destination={memory_receipt.destination}",
+        f"title={memory_receipt.message_title}",
+        f"error={memory_receipt.error or '-'}",
+    )
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        notification_path = Path(tmp_dir) / "paper-alerts.jsonl"
+        file_receipt = send_paper_alert(
+            FileNotificationChannel(path=notification_path),
+            result.alert_message,
+            destination=args.destination,
+            sent_at=sent_at,
+        )
+        rows = read_file_notifications(notification_path)
+
+    print("\nchapter-27 file_notification")
+    print(
+        f"channel={file_receipt.channel}",
+        f"accepted={file_receipt.accepted}",
+        f"rows={len(rows)}",
+        f"last_severity={rows[-1]['severity'] if rows else '-'}",
+        f"last_title={rows[-1]['message_title'] if rows else '-'}",
+    )
+
+    health = build_run_health_report(
+        price_snapshot=price_snapshot,
+        input_check=input_report,
+        result_check=result_report,
+        notification_receipt=file_receipt,
+    )
+    print("\nchapter-30 run_health")
+    print(
+        f"status={health.status}",
+        f"issue_count={health.issue_count}",
+        f"notification_accepted={health.notification_accepted}",
+        f"missing_price_count={health.missing_price_count}",
+    )
+    print(f"summary={health.summary}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Runnable examples for ZiQuant blog chapters.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -510,6 +637,24 @@ def build_parser() -> argparse.ArgumentParser:
     ops.add_argument("--secondary-target-weight", type=float, default=0.35)
     ops.add_argument("--review-note", default="daily paper ops review")
     ops.set_defaults(func=print_paper_ops)
+
+    notify = subparsers.add_parser("paper-notify", help="Run chapter 26-30 price/target/notification/health chain.")
+    notify.add_argument("--trade-date", default="2026-03-04")
+    notify.add_argument("--sent-at", default="2026-03-04T09:00:00")
+    notify.add_argument("--initial-cash", type=float, default=200000.0)
+    notify.add_argument("--seed-symbol", default="000001.SZ")
+    notify.add_argument("--seed-price", type=float, default=11.90)
+    notify.add_argument("--seed-shares", type=int, default=4000)
+    notify.add_argument("--seed-last-price", type=float, default=12.20)
+    notify.add_argument("--extra-symbol", default="600519.SH")
+    notify.add_argument("--extra-last-price", type=float, default=1498.00)
+    notify.add_argument("--candidates", nargs="+", default=["000001.SZ", "600519.SH", "000001.SZ"])
+    notify.add_argument("--max-symbols", type=int, default=2)
+    notify.add_argument("--gross-exposure", type=float, default=0.60)
+    notify.add_argument("--min-weight", type=float, default=0.01)
+    notify.add_argument("--max-total", type=float, default=0.55)
+    notify.add_argument("--destination", default="paper-daily")
+    notify.set_defaults(func=print_paper_notify)
     return parser
 
 

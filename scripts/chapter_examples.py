@@ -22,6 +22,7 @@ from app.factors import build_factor_points
 from app.file_notifications import FileNotificationChannel, read_file_notifications
 from app.market_data import CleanMarketBar, clean_market_bars, coverage_report
 from app.mini_backtest import run_signal_backtest
+from app.models import table_names
 from app.notification_channels import MemoryNotificationChannel, send_paper_alert
 from app.parameter_search import run_parameter_search, score_search_result
 from app.paper_daily_cycle import run_paper_daily_cycle
@@ -42,9 +43,13 @@ from app.run_health import RunHealthReport, build_run_health_report
 from app.run_history import summarize_archived_reports
 from app.run_request import build_daily_run_request, request_symbol_count
 from app.run_window import RunWindow, evaluate_run_window
+from app.schema_checks import migration_readiness, schema_readiness
 from app.ops_checklist import OpsChecklist, OpsChecklistItem, build_ops_checklist
 from app.ops_runbook import build_ops_runbook, runbook_as_lines
+from app.settings import Settings
+from app.stock_universe import build_public_universe, universe_summary
 from app.target_weight_policy import TargetWeightPolicy, build_equal_weight_targets, normalize_target_weights
+from app.trading_rules import check_a_share_order, estimate_a_share_fee, normalize_a_share_lot
 
 
 def _sample_rows(*, start: date, days: int, base: float, drift: float, shock_after: int | None = None) -> list[dict[str, object]]:
@@ -153,6 +158,92 @@ def _load_bars(args: argparse.Namespace) -> list[CleanMarketBar]:
     if args.source == "eastmoney":
         return eastmoney_bars(args.symbols, begin=args.begin, end=args.end)
     return [bar for bar in sample_bars() if bar.symbol in set(args.symbols)]
+
+
+def print_foundation_check(args: argparse.Namespace) -> int:
+    print("chapter-01-08 foundation_check")
+
+    names = table_names()
+    print("\nchapter-01 project_scope")
+    print(
+        "boundary=research,backtest,paper_trading,alerts",
+        "real_broker_orders=false",
+        f"model_tables={len(names)}",
+    )
+    print(f"sample_tables={names[:4]}")
+
+    print("\nchapter-02 project_structure")
+    print(
+        f"host_default={Settings.model_fields['host'].default}",
+        f"port_default={Settings.model_fields['port'].default}",
+        f"deployment_default={Settings.model_fields['zi_deployment_mode'].default}",
+        f"auto_create_schema_default={Settings.model_fields['auto_create_schema'].default}",
+    )
+    print("commands=uv sync --extra dev | uv run pytest | uv run uvicorn app.main:app")
+
+    print("\nchapter-03 core_concepts")
+    concept_tables = [
+        "zi_quant_stocks",
+        "zi_quant_market_bars",
+        "zi_quant_factor_values",
+        "zi_quant_backtest_runs",
+        "zi_quant_paper_orders",
+    ]
+    print(f"concept_tables={concept_tables}")
+    print("signal_to_order=signal -> risk_check -> paper_order")
+
+    print("\nchapter-04 a_share_rules")
+    buy_fee = estimate_a_share_fee(args.order_amount, "buy")
+    sell_fee = estimate_a_share_fee(args.order_amount, "sell")
+    order = check_a_share_order(side="buy", price=args.order_price, shares=args.order_shares, available_cash=args.available_cash)
+    print(
+        f"normalized_lot={normalize_a_share_lot(args.order_shares)}",
+        f"buy_fee={buy_fee.total:.2f}",
+        f"sell_fee={sell_fee.total:.2f}",
+        f"accepted={order.accepted}",
+        f"reason={order.reason or '-'}",
+    )
+
+    rows = [
+        {"trade_date": "2026-01-02", "open": "10.0", "high": "10.8", "low": "9.9", "close": "10.5", "volume": "120", "amount": "126000"},
+        {"trade_date": "2026-01-03", "open": "10.5", "high": "10.4", "low": "10.0", "close": "10.2", "volume": "80", "amount": "81600"},
+        {"trade_date": "2026-01-05", "open": "10.2", "high": "10.9", "low": "10.1", "close": "10.7", "volume": "150", "amount": "160500"},
+    ]
+    bars, rejected = clean_market_bars("000001.SZ", rows, source="sample", volume_unit="lot")
+    print("\nchapter-05 data_first")
+    print(
+        f"raw_rows={len(rows)}",
+        f"clean_rows={len(bars)}",
+        f"rejected_rows={len(rejected)}",
+        f"first_rejected={rejected[0]['reason'] if rejected else '-'}",
+    )
+
+    schema = schema_readiness()
+    migration = migration_readiness(Path.cwd())
+    print("\nchapter-06 schema_checks")
+    print(
+        f"schema_status={schema['status']}",
+        f"table_count={schema['table_count']}",
+        f"missing_tables={schema['missing_tables']}",
+        f"migration_status={migration['status']}",
+        f"revision_count={migration['revision_count']}",
+    )
+
+    universe = build_public_universe(
+        [
+            {"code": "600519", "name": "贵州茅台", "sector": "食品饮料", "source": "sample"},
+            {"code": "000001.SZ", "name": "平安银行", "sector": "银行", "source": "sample"},
+            {"code": "000001", "name": "平安银行", "sector": "银行", "source": "duplicate"},
+            {"code": "600000", "name": "ST 测试", "sector": "风险", "source": "sample"},
+        ],
+        limit=args.universe_limit,
+    )
+    print("\nchapter-07 stock_universe")
+    print(f"symbols={[item.symbol for item in universe]} summary={universe_summary(universe)}")
+
+    print("\nchapter-08 market_data_cleaning")
+    print(f"coverage={coverage_report(bars)} rejected={rejected}")
+    return 0
 
 
 def print_factor_backtest(args: argparse.Namespace) -> int:
@@ -884,6 +975,14 @@ def print_paper_command(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Runnable examples for ZiQuant blog chapters.")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    foundation = subparsers.add_parser("foundation-check", help="Run chapter 01-08 project/rules/schema/universe/data checks.")
+    foundation.add_argument("--order-amount", type=float, default=20000.0)
+    foundation.add_argument("--order-price", type=float, default=12.46)
+    foundation.add_argument("--order-shares", type=int, default=258)
+    foundation.add_argument("--available-cash", type=float, default=50000.0)
+    foundation.add_argument("--universe-limit", type=int, default=500)
+    foundation.set_defaults(func=print_foundation_check)
+
     factor = subparsers.add_parser("factor-backtest", help="Run chapter 09-12 factor/backtest chain.")
     factor.add_argument("--source", choices=["sample", "eastmoney"], default="sample")
     factor.add_argument("--symbols", nargs="+", default=["000001.SZ", "600519.SH"])

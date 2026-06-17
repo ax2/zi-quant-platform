@@ -9,6 +9,17 @@ def test_sample_bars_cover_two_symbols():
     assert all(bar.source == "sample" for bar in bars)
 
 
+def test_foundation_check_parser_defaults_to_reproducible_sample_data():
+    parser = build_parser()
+    args = parser.parse_args(["foundation-check"])
+
+    assert args.order_amount == 20000.0
+    assert args.order_price == 12.46
+    assert args.order_shares == 258
+    assert args.available_cash == 50000.0
+    assert args.universe_limit == 500
+
+
 def test_factor_backtest_parser_defaults_to_reproducible_sample_data():
     parser = build_parser()
     args = parser.parse_args(["factor-backtest"])

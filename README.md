@@ -25,7 +25,7 @@
 启动：
 
 ```bash
-cd /home/alex/work/yswx/zi-quant-platform
+cd /opt/zi-quant-platform
 uv sync --extra dev
 uv run uvicorn app.main:app --host 127.0.0.1 --port 8092
 ```
@@ -79,7 +79,7 @@ pg_restore --clean --if-exists --no-owner --dbname postgresql://zi_quant@127.0.0
 生产环境建议用 cron 或 systemd timer 至少每日备份一次，并把 `/var/backups/zi-quant` 纳入主机级备份或对象存储归档。示例 cron：
 
 ```cron
-15 2 * * * cd /home/alex/work/yswx/zi-quant-platform && set -a && . ./.env && set +a && uv run zi-quant-db-backup --output-dir /var/backups/zi-quant >/var/log/zi-quant-db-backup.log 2>&1
+15 2 * * * cd /opt/zi-quant-platform && set -a && . ./.env && set +a && uv run zi-quant-db-backup --output-dir /var/backups/zi-quant >/var/log/zi-quant-db-backup.log 2>&1
 ```
 
 该备份流程只读取 PostgreSQL 数据，不同步外部数据、不改模拟盘、不提交真实交易订单，也不构成投资建议。
@@ -412,8 +412,8 @@ Description=Zi Quant due job runner
 After=network.target postgresql.service
 
 [Service]
-WorkingDirectory=/home/alex/work/yswx/zi-quant-platform
-EnvironmentFile=/home/alex/work/yswx/zi-quant-platform/.env
+WorkingDirectory=/opt/zi-quant-platform
+EnvironmentFile=/opt/zi-quant-platform/.env
 ExecStart=/usr/bin/env uv run python scripts/run_due_jobs.py --loop --interval-seconds 60 --limit 3
 Restart=always
 RestartSec=5

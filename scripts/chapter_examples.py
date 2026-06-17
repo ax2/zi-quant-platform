@@ -10,12 +10,17 @@ from urllib.request import Request, urlopen
 
 from app.factors import build_factor_points
 from app.experiment_records import build_experiment_record, experiment_record_payload
+from app.alert_messages import format_paper_daily_alert
 from app.market_data import CleanMarketBar, clean_market_bars, coverage_report
 from app.mini_backtest import run_signal_backtest
 from app.parameter_search import run_parameter_search, score_search_result
+from app.paper_ledger import PaperAccountState, apply_paper_order
+from app.paper_risk import evaluate_paper_risk
+from app.paper_snapshots import build_paper_account_snapshot
 from app.performance_metrics import compute_performance_metrics
 from app.portfolio_backtest import portfolio_trade_summary, run_equal_weight_portfolio_backtest
 from app.promotion_gate import evaluate_strategy_promotion, promotion_decision_payload
+from app.rebalance_plan import build_rebalance_plan
 
 
 def _sample_rows(*, start: date, days: int, base: float, drift: float, shock_after: int | None = None) -> list[dict[str, object]]:
@@ -247,6 +252,96 @@ def print_strategy_promotion(args: argparse.Namespace) -> int:
     return 0
 
 
+def print_paper_flow(args: argparse.Namespace) -> int:
+    trade_date = date.fromisoformat(args.trade_date)
+    account = PaperAccountState(cash=args.initial_cash)
+    print(f"initial_account cash={account.cash:.2f} positions={len(account.positions)}")
+
+    buy = apply_paper_order(
+        account,
+        trade_date=trade_date,
+        symbol=args.symbol,
+        side="buy",
+        price=args.buy_price,
+        shares=args.buy_shares,
+    )
+    account = buy.account
+    print("\nchapter-16 paper_ledger")
+    print(
+        f"accepted={buy.accepted}",
+        f"side={buy.side}",
+        f"filled_shares={buy.filled_shares}",
+        f"amount={buy.amount:.2f}",
+        f"fee={buy.fee:.2f}",
+        f"cash_after={account.cash:.2f}",
+        f"reason={buy.reason}",
+    )
+
+    last_prices = {args.symbol: args.last_price}
+    snapshot = build_paper_account_snapshot(account, trade_date=trade_date, last_prices=last_prices)
+    print("\nchapter-17 paper_snapshot")
+    print(
+        f"trade_date={snapshot.trade_date.isoformat()}",
+        f"cash={snapshot.cash:.2f}",
+        f"market_value={snapshot.market_value:.2f}",
+        f"total_equity={snapshot.total_equity:.2f}",
+        f"cash_ratio={snapshot.cash_ratio:.2%}",
+    )
+    for position in snapshot.positions:
+        print(
+            f"position={position.symbol}",
+            f"shares={position.shares}",
+            f"avg_cost={position.avg_cost:.4f}",
+            f"last_price={position.last_price:.2f}",
+            f"weight={position.weight:.2%}",
+            f"unrealized_pnl={position.unrealized_pnl:.2f}",
+        )
+
+    risk_report = evaluate_paper_risk(
+        snapshot,
+        max_position_weight=args.max_position_weight,
+        min_cash_ratio=args.min_cash_ratio,
+        max_exposure_ratio=args.max_exposure_ratio,
+    )
+    print("\nchapter-18 paper_risk")
+    print(f"passed={risk_report.passed} severity={risk_report.severity} violations={len(risk_report.violations)}")
+    for violation in risk_report.violations:
+        target = f" symbol={violation.symbol}" if violation.symbol else ""
+        print(
+            f"code={violation.code}{target}",
+            f"value={violation.value:.2%}",
+            f"limit={violation.limit:.2%}",
+            f"severity={violation.severity}",
+        )
+
+    target_weights = {args.symbol: args.target_weight}
+    plan = build_rebalance_plan(
+        account,
+        trade_date=trade_date,
+        last_prices=last_prices,
+        target_weights=target_weights,
+        min_trade_value=args.min_trade_value,
+    )
+    print("\nchapter-19 rebalance_plan")
+    print(f"total_equity={plan.total_equity:.2f} orders={len(plan.orders)}")
+    for order in plan.orders:
+        print(
+            f"{order.side} {order.symbol}",
+            f"shares={order.shares}",
+            f"price={order.price:.2f}",
+            f"current_weight={order.current_weight:.2%}",
+            f"target_weight={order.target_weight:.2%}",
+            f"delta_value={order.delta_value:.2f}",
+        )
+
+    alert = format_paper_daily_alert(snapshot, risk_report, plan)
+    print("\nchapter-20 alert_message")
+    print(f"title={alert.title}")
+    print(f"severity={alert.severity}")
+    print(alert.body)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Runnable examples for ZiQuant blog chapters.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -274,6 +369,20 @@ def build_parser() -> argparse.ArgumentParser:
     promotion.add_argument("--baseline-long-window", type=int, default=20)
     promotion.add_argument("--baseline-position-ratio", type=float, default=0.8)
     promotion.set_defaults(func=print_strategy_promotion)
+
+    paper = subparsers.add_parser("paper-flow", help="Run chapter 16-20 paper trading account/risk/alert chain.")
+    paper.add_argument("--trade-date", default="2026-03-02")
+    paper.add_argument("--initial-cash", type=float, default=100000.0)
+    paper.add_argument("--symbol", default="000001.SZ")
+    paper.add_argument("--buy-price", type=float, default=12.46)
+    paper.add_argument("--buy-shares", type=int, default=6400)
+    paper.add_argument("--last-price", type=float, default=13.25)
+    paper.add_argument("--target-weight", type=float, default=0.45)
+    paper.add_argument("--min-trade-value", type=float, default=1000.0)
+    paper.add_argument("--max-position-weight", type=float, default=0.35)
+    paper.add_argument("--min-cash-ratio", type=float, default=0.05)
+    paper.add_argument("--max-exposure-ratio", type=float, default=0.95)
+    paper.set_defaults(func=print_paper_flow)
     return parser
 
 

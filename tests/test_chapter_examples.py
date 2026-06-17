@@ -75,3 +75,13 @@ def test_paper_ops_check_parser_defaults_to_reproducible_ops_cycle():
     assert args.seed_symbol == "000001.SZ"
     assert args.extra_symbol == "600519.SH"
     assert args.candidates == ["000001.SZ", "600519.SH"]
+
+
+def test_paper_run_plan_parser_defaults_to_reproducible_plan_cycle():
+    parser = build_parser()
+    args = parser.parse_args(["paper-run-plan"])
+
+    assert args.trade_date == "2026-03-06"
+    assert args.generated_at == "2026-03-06T15:20:00"
+    assert args.required_symbols == ["000001.SZ", "600519.SH", "000001.SZ"]
+    assert args.dry_run is False

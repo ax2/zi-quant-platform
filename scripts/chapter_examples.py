@@ -11,6 +11,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from app.alert_messages import format_paper_daily_alert
+from app.daily_run_plan import build_daily_run_plan, plan_can_execute
 from app.data_gaps import build_price_gap_plan, gap_symbols
 from app.experiment_records import build_experiment_record, experiment_record_payload
 from app.factors import build_factor_points
@@ -32,8 +33,10 @@ from app.production_checks import check_paper_cycle_inputs, check_paper_cycle_re
 from app.promotion_gate import evaluate_strategy_promotion, promotion_decision_payload
 from app.rebalance_plan import build_rebalance_plan
 from app.report_archive import archive_daily_report, read_archived_report
+from app.report_index import build_report_index, latest_report_entry
 from app.run_health import RunHealthReport, build_run_health_report
 from app.run_history import summarize_archived_reports
+from app.run_request import build_daily_run_request, request_symbol_count
 from app.run_window import RunWindow, evaluate_run_window
 from app.ops_checklist import build_ops_checklist
 from app.target_weight_policy import TargetWeightPolicy, build_equal_weight_targets, normalize_target_weights
@@ -718,6 +721,95 @@ def print_paper_ops_check(args: argparse.Namespace) -> int:
     return 0
 
 
+def print_paper_run_plan(args: argparse.Namespace) -> int:
+    trade_date = date.fromisoformat(args.trade_date)
+    generated_at = datetime.fromisoformat(args.generated_at).replace(tzinfo=timezone.utc)
+    request = build_daily_run_request(
+        trade_date=trade_date,
+        generated_at=generated_at,
+        required_symbols=args.required_symbols,
+        dry_run=args.dry_run,
+    )
+
+    print("chapter-36-40 paper_run_plan")
+    print("\nchapter-36 run_request")
+    print(
+        f"trade_date={request.trade_date.isoformat()}",
+        f"generated_at={request.generated_at.isoformat()}",
+        f"required_symbols={request.required_symbols}",
+        f"symbol_count={request_symbol_count(request)}",
+        f"dry_run={request.dry_run}",
+    )
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        archive_dir = Path(tmp_dir) / "reports"
+        for offset, status in ((2, "ok"), (1, "blocker"), (0, "ok")):
+            day = trade_date - timedelta(days=offset)
+            archive_daily_report(
+                directory=archive_dir,
+                trade_date=day,
+                alert_message=format_paper_daily_alert(
+                    build_paper_account_snapshot(PaperAccountState(cash=100000.0), trade_date=day, last_prices={}),
+                    evaluate_paper_risk(build_paper_account_snapshot(PaperAccountState(cash=100000.0), trade_date=day, last_prices={})),
+                    build_rebalance_plan(PaperAccountState(cash=100000.0), trade_date=day, last_prices={}, target_weights={}),
+                ),
+                health_report=RunHealthReport(
+                    status=status,
+                    issue_count=1 if status == "blocker" else 0,
+                    notification_accepted=status != "blocker",
+                    missing_price_count=1 if status == "blocker" else 0,
+                    summary=status,
+                ),
+                review_record=run_paper_daily_cycle(
+                    PaperAccountState(cash=100000.0),
+                    trade_date=day,
+                    last_prices={},
+                    target_weights={},
+                    review_note=f"{status} archive",
+                ).review_record,
+            )
+        index = build_report_index(archive_dir)
+        latest = latest_report_entry(index)
+        history = summarize_archived_reports(archive_dir)
+
+    print("\nchapter-38 report_index")
+    print(f"index_count={len(index)} latest={latest.trade_date if latest else '-'} latest_status={latest.status if latest else '-'}")
+    for entry in index:
+        print(f"{entry.trade_date} status={entry.status} path={entry.path.name}")
+
+    checklist = build_ops_checklist(
+        window_status=evaluate_run_window(generated_at, RunWindow(start=time(15, 10), end=time(15, 40))),
+        history_summary=history,
+        gap_plan=build_price_gap_plan(
+            StaticPriceProvider({args.required_symbols[0]: args.first_price}).get_last_prices(list(request.required_symbols), trade_date=trade_date),
+            required_symbols=list(request.required_symbols),
+        ),
+        health_report=RunHealthReport("ok", 0, True, 0, "ok"),
+    )
+    plan = build_daily_run_plan(request=request, checklist=checklist)
+
+    print("\nchapter-37 run_result")
+    print(
+        f"status={plan.result.status}",
+        f"dry_run={plan.result.dry_run}",
+        f"failed_checks={plan.result.failed_checks}",
+    )
+
+    print("\nchapter-39 failure_actions")
+    print(f"action_summary={plan.action_summary} actions={len(plan.failure_actions)}")
+    for action in plan.failure_actions:
+        print(f"{action.check_name}: action={action.action} severity={action.severity}")
+
+    print("\nchapter-40 daily_run_plan")
+    print(
+        f"trade_date={plan.request.trade_date.isoformat()}",
+        f"result={plan.result.status}",
+        f"can_execute={plan_can_execute(plan)}",
+        f"action_summary={plan.action_summary}",
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Runnable examples for ZiQuant blog chapters.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -812,6 +904,14 @@ def build_parser() -> argparse.ArgumentParser:
     ops_check.add_argument("--max-total", type=float, default=0.55)
     ops_check.add_argument("--destination", default="paper-daily")
     ops_check.set_defaults(func=print_paper_ops_check)
+
+    run_plan = subparsers.add_parser("paper-run-plan", help="Run chapter 36-40 request/result/index/failure/plan chain.")
+    run_plan.add_argument("--trade-date", default="2026-03-06")
+    run_plan.add_argument("--generated-at", default="2026-03-06T15:20:00")
+    run_plan.add_argument("--required-symbols", nargs="+", default=["000001.SZ", "600519.SH", "000001.SZ"])
+    run_plan.add_argument("--first-price", type=float, default=12.30)
+    run_plan.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=False)
+    run_plan.set_defaults(func=print_paper_run_plan)
     return parser
 
 
